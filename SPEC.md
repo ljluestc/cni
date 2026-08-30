@@ -246,6 +246,10 @@ If the CNI plugin is successful, it must output a [result structure](#Success) (
 
 If an interface of the requested name already exists in the container, the CNI plugin MUST return with an error.
 
+If the plugin fails part-way through an `ADD`, it should make a best-effort attempt to undo any modifications it has already applied before returning the error, so that a failed `ADD` leaves as little state behind as possible.
+In particular, if the plugin has already successfully executed a [delegated plugin](#section-4-plugin-delegation), it must execute that delegated plugin again with `CNI_COMMAND=DEL` before returning the error.
+A plugin must not, however, rely on this cleanup being sufficient: the runtime will still issue a _delete_ for the attachment (see [Lifecycle & Ordering](#lifecycle--ordering)), and the plugin must tolerate that `DEL`.
+
 A runtime should not call `ADD` twice (without an intervening DEL) for the same `(CNI_CONTAINERID, CNI_IFNAME)` tuple. This implies that a given container ID may be added to a specific network more than once only if each addition is done with a different interface name.
 
 **Input:**
@@ -274,6 +278,8 @@ Plugins should still return without error if `prevResult` is empty for a `DEL` c
 `DEL` command invocations are always considered best-effort - plugins should always complete a `DEL` action without error to the fullest extent possible, even if some resources or state are missing. For example, an IPAM plugin should generally release an IP allocation and return success even if the container network namespace no longer exists, unless that network namespace is critical for IPAM management. While DHCP may usually send a 'release' message on the container network interface, since DHCP leases have a lifetime this release action would not be considered critical and no error should be returned if this action fails. For another example, the `bridge` plugin should delegate the DEL action to the IPAM plugin and clean up its own resources even if the container network namespace and/or container network interface no longer exist.
 
 Plugins MUST accept multiple `DEL` calls for the same (`CNI_CONTAINERID`, `CNI_IFNAME`) pair, and return success if the interface in question, or any modifications added, are missing.
+
+Plugins MUST also accept a `DEL` for an attachment whose `ADD` failed, or which was never `ADD`ed at all - for example, when a runtime deletes an attachment after a plugin earlier in the chain failed. In that case the plugin may hold no state, partial state, or complete state for the attachment, and it must return success in all three cases. Since a failed _add_ produces no final result, the `prevResult` supplied with such a `DEL` may be absent or incomplete, and the plugin must not require it.
 
 **Input:**
 
@@ -415,7 +421,8 @@ The operation of a network configuration on a container is called an _attachment
 - The container runtime must not invoke parallel operations for the same container, but is allowed to invoke parallel operations for different containers. This includes across multiple attachments.
   - **Exception**: The runtime must exclusively execute either _gc_ or _add_ and _delete_. The runtime must ensure that no _add_ or _delete_ operations are in progress before executing _gc_, and must wait for _gc_ to complete before issuing new _add_ or _delete_ commands.
 - Plugins must handle being executed concurrently across different containers. If necessary, they must implement locking on shared resources (e.g. IPAM databases).
-- The container runtime must ensure that _add_ is eventually followed by a corresponding _delete_. The only exception is in the event of catastrophic failure, such as node loss. A _delete_ must still be executed even if the _add_ fails.
+- The container runtime must ensure that _add_ is eventually followed by a corresponding _delete_. The only exception is in the event of catastrophic failure, such as node loss. A _delete_ must still be executed even if the _add_ fails, and the runtime should issue that _delete_ before reusing the `(CNI_CONTAINERID, CNI_IFNAME)` tuple for another _add_.
+  - **Exception**: if a plugin fails with error code `3` (_container unknown or does not exist_), no network state can exist for the attachment and the runtime need not issue a _delete_.
 - _delete_ may be followed by additional _deletes_.
 - The network configuration should not change between _add_ and _delete_.
 - The network configuration should not change between _attachments_.
@@ -441,12 +448,15 @@ For every configuration defined in the `plugins` key of the network configuratio
 3. Execute the plugin binary, with `CNI_COMMAND=ADD`. Provide parameters defined above as environment variables. Supply the derived configuration via standard in.
 4. If the plugin returns an error, halt execution and return the error to the caller.
 
+If any plugin in the list returns an error, the _add_ as a whole has failed, and the runtime must _delete_ the attachment as described below. The runtime should do so before returning the error to its caller; if it cannot, it must still ensure the _delete_ happens eventually. The _delete_ covers the entire plugin list, not only the plugins that were executed, because a plugin may have created state before failing. The sole exception is error code `3` (_container unknown or does not exist_), which implies no network state exists to clean up.
+
 The runtime must store the result returned by the final plugin persistently, as it is required for _check_ and _delete_ operations.
 
 ### Deleting an attachment
 Deleting a network attachment is much the same as adding, with a few key differences:
 - The list of plugins is executed in **reverse order**
 - The previous result provided is always the final result of the _add_ operation.
+- If the _add_ failed, no such result exists. The runtime should then supply the result of the last plugin that succeeded, if it has one, and otherwise supply no previous result at all. Plugins must return success regardless (see [`DEL`](#del-remove-container-from-network-or-un-apply-modifications)).
 
 For every plugin defined in the `plugins` key of the network configuration, *in reverse order*,
 1. Look up the executable specified in the `type` field. If this does not exist, then this is an error.
@@ -560,7 +570,11 @@ When a plugin executes a delegated plugin, it should:
 
 If a plugin is executed with `CNI_COMMAND=CHECK`, `DEL`, or `GC`, it must also execute any delegated plugins. If any of the delegated plugins return error, error should be returned by the upper plugin.
 
-If, on `ADD`, a delegated plugin fails, the "upper" plugin should execute again with `DEL` before returning failure.
+If, on `ADD`, a delegated plugin fails, the "upper" plugin should execute the delegated plugins it has already run successfully with `CNI_COMMAND=DEL`, and undo its own modifications, before returning failure.
+
+Likewise, if the "upper" plugin itself fails on `ADD` *after* a delegated plugin has succeeded - for example, an IPAM allocation succeeds but creating the interface then fails - it must execute that delegated plugin with `CNI_COMMAND=DEL` before returning the error, so the delegated plugin's resources (such as the allocated IP) are not leaked.
+
+These cleanup `DEL` calls are best-effort. If one fails, the "upper" plugin should still return the original `ADD` error, since the runtime will issue a _delete_ for the attachment regardless.
 
 ## Section 5: Result Types
 
